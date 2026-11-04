@@ -25,9 +25,14 @@ def _stem(word: str) -> str:
     if len(word) > 4 and word.endswith("ies"):
         return word[:-3] + "y"
     if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
-        return word[:-1]
-    if len(word) > 4 and word.endswith("ed"):
-        return word[:-2]
+        word = word[:-1]
+    if len(word) > 5 and word.endswith("ing"):
+        word = word[:-3]
+    elif len(word) > 4 and word.endswith("ed"):
+        word = word[:-2]
+    # Drop a trailing silent 'e' so 'arrive', 'arrived', 'arriving' all become 'arriv'.
+    if len(word) > 4 and word.endswith("e"):
+        word = word[:-1]
     return word
 
 

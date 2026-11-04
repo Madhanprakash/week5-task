@@ -1,594 +1,476 @@
-"""BrightCart AI Customer Support Desk: Streamlit UI.
+"""Streamlit UI for the AI Customer Support Desk.
 
 Run with:  streamlit run app.py
+
+Pages (kept in st.session_state["page"]):
+  customer  - complaint form + confirmation (what customers see)
+  login     - helpdesk sign in
+  helpdesk  - all tickets, ticket details, actions and status updates
 """
 import asyncio
+import hmac
+import html
 import os
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-    _PLOTLY = True
-except ImportError:
-    _PLOTLY = False
-
-from agents.ticket_store import LOG_FILE, read_tickets, update_ticket_status
+from agents.ticket_store import (LOG_FILE, VALID_STATUSES, read_actions,
+                                 read_contact, read_tickets, record_action,
+                                 save_contact, valid_contact)
+from sample_complaints import ALL_SAMPLES
 from team import run_ticket
 
 load_dotenv()
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="BrightCart Support",
-    page_icon="🛒",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-HELPDESK_USER     = os.getenv("HELPDESK_USER", "helpdesk")
-HELPDESK_PASS     = os.getenv("HELPDESK_PASS", "support123")
-OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Helpdesk login. Set HELPDESK_USER and HELPDESK_PASS in your .env file.
+# The defaults below are for local demos only.
+HELPDESK_USER = os.getenv("HELPDESK_USER", "helpdesk")
+HELPDESK_PASS = os.getenv("HELPDESK_PASS", "support123")
+USING_DEFAULT_LOGIN = "HELPDESK_PASS" not in os.environ
 
-ALL_STATUSES      = ["Escalated", "Open", "In Progress", "Resolved", "Closed"]
-
-AGENT_INFO = {
-    "QueryAgent":      ("🔎", "Query",      "Reads the complaint — category, urgency, mood"),
-    "KnowledgeAgent":  ("📚", "Knowledge",  "Searches company policy documents"),
-    "ResolutionAgent": ("✍️", "Resolution", "Writes the reply from policy facts only"),
-    "LogAgent":        ("🗂️", "Log",        "Saves the ticket and applies escalation rules"),
+AGENTS = {
+    "QueryAgent": ("🔎", "Query", "Reads the complaint and finds the category, urgency and mood"),
+    "KnowledgeAgent": ("📚", "Knowledge", "Searches the company documents"),
+    "ResolutionAgent": ("✍️", "Resolution", "Writes the reply using only policy facts"),
+    "LogAgent": ("🗂️", "Log", "Saves the ticket and applies the escalation rules"),
+}
+RULES = [
+    "Urgency is High",
+    "Customer is very angry",
+    "No matching company document",
+    "Legal threat, fraud or payment dispute",
+    "Reply confidence is Low",
+]
+FORM_KEYS = ["name", "order", "contact", "complaint"]
+STATUS_COLOURS = {
+    "Escalated": "background-color:#FFEBE9;color:#82071E;font-weight:600",
+    "Resolved": "background-color:#DAFBE1;color:#116329;font-weight:600",
+    "Open": "background-color:#dbeafe;color:#1e40af;font-weight:600",
+    "In Progress": "background-color:#fef9c3;color:#854d0e;font-weight:600",
+    "Closed": "background-color:#e5e7eb;color:#374151;font-weight:600",
 }
 
-SAMPLES = {
-    "Late delivery":   "Where is my order? It was supposed to arrive yesterday.",
-    "Refund request":  "I want to return the shoes I bought last week. How do I get a refund?",
-    "Password reset":  "I forgot my password and can't log in.",
-    "Broken item":     "The blender I received is broken. Can I get a replacement?",
-    "Billing + legal": "You charged my card three times! Fix this now or I'm contacting my bank and a lawyer.",
-    "Out-of-policy":   "Do you sell gift cards for a company of 500 employees with custom branding?",
-}
-
-STATUS_STYLE = {
-    "Escalated":   ("#fee2e2", "#991b1b", "🔴"),
-    "Open":        ("#dbeafe", "#1e40af", "🔵"),
-    "In Progress": ("#fef9c3", "#854d0e", "🟡"),
-    "Resolved":    ("#dcfce7", "#166534", "🟢"),
-    "Closed":      ("#f1f5f9", "#475569", "⚫"),
-}
-
-# ── CSS ───────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="BrightCart Support", page_icon="🛒", layout="wide")
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+[data-testid="stSidebar"] { background: #F6F7F9; border-right: 1px solid #E3E6EA; }
+[data-testid="stSidebar"][aria-expanded="true"] { width: 260px !important; min-width: 260px !important; }
+[data-testid="stMainBlockContainer"] { padding: 48px 40px 32px; }
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color: #57606A !important; opacity: 1 !important; }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] ul { padding-left: 18px; margin: 0; }
+[data-testid="stSidebar"] li { font-size: 14px; line-height: 1.7; margin: 0; padding: 0; }
+h1 { font-size: 34px !important; font-weight: 700 !important; padding: 0 !important; }
 
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-#MainMenu, footer { visibility: hidden; }
-header { visibility: hidden; }
-
-.main .block-container { padding-top: 0; padding-bottom: 2rem; max-width: 1200px; }
-
-/* ── Top bar ── */
-.topbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 1rem 0 0.75rem;
-    border-bottom: 1px solid #e2e8f0;
-    margin-bottom: 1.5rem;
+/* Inputs: white with a thin border */
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"], [data-baseweb="select"] > div {
+    background: #fff !important; border-color: #D0D7DE !important; border-radius: 6px !important;
 }
-.brand-name  { font-size: 1.2rem; font-weight: 700; color: #0f172a; letter-spacing: -0.02em; }
-.brand-badge {
-    display: inline-block;
-    background: #dbeafe; color: #1e40af;
-    font-size: 0.7rem; font-weight: 700;
-    padding: 0.15rem 0.5rem; border-radius: 999px;
-    letter-spacing: 0.05em; text-transform: uppercase;
-    margin-left: 0.4rem; vertical-align: middle;
-}
+[data-testid="stMain"] input, [data-testid="stMain"] textarea, [data-testid="stMain"] [data-baseweb="select"] div { background: #fff !important; }
 
-/* ── Metric tiles ── */
-[data-testid="metric-container"] {
-    background: #ffffff; border: 1px solid #e2e8f0;
-    border-radius: 12px; padding: 1rem 1.25rem;
-    box-shadow: 0 1px 3px rgba(15,23,42,0.04);
-    transition: box-shadow 0.2s;
-}
-[data-testid="metric-container"]:hover { box-shadow: 0 4px 16px rgba(15,23,42,0.08); }
-[data-testid="stMetricLabel"]  { font-size: 0.68rem !important; font-weight: 600 !important; text-transform: uppercase !important; letter-spacing: 0.07em !important; color: #64748b !important; }
-[data-testid="stMetricValue"]  { font-size: 1.9rem !important; font-weight: 700 !important; color: #0f172a !important; line-height: 1.2 !important; }
+/* Summary cards, and the borderless version under a ticket result */
+[data-testid="stMetric"] { border: 1px solid #E3E6EA; border-radius: 8px; padding: 14px 16px; }
+[data-testid="stMetricLabel"] p { font-size: 13px; color: #57606A; }
+[data-testid="stMetricValue"] { font-size: 28px; font-weight: 700; }
+[class*="st-key-result_stats"] [data-testid="stMetric"] { border: 0; padding: 0; }
+[class*="st-key-result_stats"] [data-testid="stMetricValue"] { font-size: 20px; font-weight: 600; }
 
-/* ── Tabs ── */
-.stTabs [data-baseweb="tab-list"] { gap: 0; border-bottom: 2px solid #e2e8f0; background: transparent; }
-.stTabs [data-baseweb="tab"] { height: 42px; padding: 0 1.1rem; font-weight: 500; font-size: 0.875rem; color: #64748b; border-bottom: 2px solid transparent; margin-bottom: -2px; background: transparent !important; }
-.stTabs [aria-selected="true"] { color: #2563eb !important; border-bottom-color: #2563eb !important; }
-
-/* ── Forms ── */
-[data-testid="stTextInput"] input,
-[data-testid="stTextArea"] textarea {
-    border-radius: 8px !important; border: 1.5px solid #e2e8f0 !important; font-size: 0.875rem !important;
-}
-[data-testid="stTextInput"] input:focus,
-[data-testid="stTextArea"] textarea:focus {
-    border-color: #2563eb !important; box-shadow: 0 0 0 3px rgba(37,99,235,0.1) !important;
-}
-[data-testid="stFormSubmitButton"] button {
-    background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
-    border: none !important; border-radius: 8px !important; font-weight: 600 !important; font-size: 0.875rem !important;
-}
-.stButton > button { border-radius: 8px !important; font-weight: 500 !important; font-size: 0.875rem !important; }
-
-/* ── Customer hero ── */
-.hero-heading { font-size: 2rem; font-weight: 700; letter-spacing: -0.03em; color: #0f172a; margin-bottom: 0.4rem; }
-.hero-sub     { font-size: 1rem; color: #64748b; margin-bottom: 1.75rem; }
-
-/* ── Confirmation card ── */
-.confirm-card {
-    background: #f0fdf4; border: 1px solid #86efac; border-radius: 12px;
-    padding: 1.5rem 1.75rem; margin-bottom: 1.25rem;
-}
-.confirm-title { font-size: 1.1rem; font-weight: 700; color: #166534; margin-bottom: 0.4rem; }
-.confirm-id    { font-size: 1.5rem; font-weight: 800; color: #15803d; letter-spacing: -0.02em; }
-.confirm-sub   { font-size: 0.85rem; color: #4ade80; color: #166534; margin-top: 0.5rem; }
-
-/* ── Login card ── */
-.login-card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 2rem; box-shadow: 0 4px 24px rgba(15,23,42,0.08); }
-.login-title { font-size: 1.25rem; font-weight: 700; color: #0f172a; margin-bottom: 0.25rem; text-align: center; }
-.login-sub   { font-size: 0.8rem; color: #64748b; text-align: center; margin-bottom: 1.25rem; }
-
-/* ── Helpdesk ticket detail ── */
-.detail-header { font-size: 0.95rem; font-weight: 700; color: #0f172a; margin-bottom: 0.5rem; }
-.detail-row    { display: flex; gap: 0.6rem; align-items: baseline; font-size: 0.85rem; margin-bottom: 0.3rem; }
-.detail-key    { font-weight: 600; color: #475569; min-width: 120px; }
-.detail-val    { color: #1e293b; }
-
-/* ── Status badge ── */
-.sbadge {
-    display: inline-block; padding: 0.18rem 0.6rem;
-    border-radius: 999px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
-}
-
-/* ── Agent step ── */
-.agent-step { background: #f8fafc; border: 1px solid #e8f0fe; border-left: 3px solid #2563eb; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 0.5rem; }
-.agent-step-title { font-weight: 600; color: #1e293b; }
-.agent-step-desc  { color: #64748b; font-size: 0.78rem; font-style: italic; }
-
-/* ── Misc ── */
-[data-testid="stExpander"]       { border: 1px solid #e2e8f0 !important; border-radius: 10px !important; }
-[data-testid="stDataFrame"]      { border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; }
-[data-testid="stDownloadButton"] button { border-radius: 8px !important; font-size: 0.85rem !important; }
-
-/* ── Dark mode ── */
-@media (prefers-color-scheme: dark) {
-    .brand-name  { color: #f1f5f9; }
-    .hero-heading { color: #f1f5f9; }
-    [data-testid="metric-container"] { background: #1e293b; border-color: #334155; box-shadow: none; }
-    [data-testid="stMetricLabel"]    { color: #94a3b8 !important; }
-    [data-testid="stMetricValue"]    { color: #f8fafc !important; }
-    .detail-key  { color: #94a3b8; }
-    .detail-val  { color: #e2e8f0; }
-    .agent-step  { background: #1e293b; border-color: #334155; border-left-color: #3b82f6; }
-    .agent-step-title { color: #f1f5f9; }
-    .login-card  { background: #1e293b; border-color: #334155; }
-    .login-title { color: #f1f5f9; }
-}
+.bc-brand { font-weight: 700; font-size: 18px; }
+.bc-label { font-size: 13px; color: #57606A; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.bc-heading { font-size: 20px; font-weight: 700; }
+.bc-banner { border-radius: 6px; padding: 12px 16px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.bc-banner b { font-weight: 700; }
+.bc-banner small { display: block; margin-top: 6px; font-size: 13px; color: #57606A; }
+.bc-ok { background: #DAFBE1; color: #116329; font-weight: 600; }
+.bc-bad { background: #FFEBE9; color: #82071E; border-left: 4px solid #CF222E; }
+.bc-reply { background: #DDF4FF; color: #0A3069; }
+.step-title { font-weight: 600; }
+.step-desc { color: #57606A; font-size: 0.85rem; }
 </style>
 """, unsafe_allow_html=True)
 
-
-# ── Session state init ────────────────────────────────────────────────────────
-for _k, _v in {
-    "logged_in":          False,
-    "show_login":         False,
-    "selected_ticket_id": None,
-    "last_submission_id": None,
-    "complaint":          "",
-    "login_error":        "",
-}.items():
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
+if "page" not in st.session_state:
+    st.session_state["page"] = "customer"
 
 
-# ── Shared helpers ────────────────────────────────────────────────────────────
-def status_badge(status: str) -> str:
-    bg, color, emoji = STATUS_STYLE.get(status, ("#f1f5f9", "#475569", "⚪"))
-    return (
-        f'<span class="sbadge" style="background:{bg};color:{color};">'
-        f'{emoji} {status}</span>'
-    )
+# ------------------------------------------------------------------ helpers
+def go(page):
+    st.session_state["page"] = page
+    st.rerun()
 
 
-def render_bar_chart(series: pd.Series, title: str) -> None:
-    if _PLOTLY and not series.empty:
-        df = series.value_counts().reset_index()
-        df.columns = ["label", "count"]
-        fig = px.bar(df, x="label", y="count", text="count",
-                     color_discrete_sequence=["#3b82f6"])
-        fig.update_traces(textposition="outside", marker_line_width=0, textfont_size=11)
-        fig.update_layout(
-            title=dict(text=title, font_size=13, font_color="#1e293b"),
-            xaxis=dict(title="", showgrid=False, tickfont_size=11),
-            yaxis=dict(title="", showgrid=True, gridcolor="#f1f5f9",
-                       tickfont_size=11, rangemode="tozero"),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font_family="Inter, sans-serif", margin=dict(l=0, r=0, t=28, b=0),
-            showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
+def find_ticket(ticket_id):
+    for row in read_tickets():
+        if row["ticket_id"] == ticket_id:
+            return row
+    return None
+
+
+def short_text(agent, text):
+    """One-line version of an agent message for the step cards."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if agent == "QueryAgent":
+        return " · ".join(lines)
+    return lines[0] if lines else ""
+
+
+def colour_status(value):
+    return STATUS_COLOURS.get(value, "")
+
+
+def load_sample(sample):
+    """Button callback: put the chosen sample into the form fields."""
+    st.session_state["name"] = sample["name"]
+    st.session_state["order"] = sample["order_id"]
+    st.session_state["contact"] = sample["contact"]
+    st.session_state["complaint"] = sample["complaint"]
+
+
+def banner(kind, title="", body="", note=""):
+    """Coloured box (ok, bad or reply). All text is escaped: it can come from customers."""
+    parts = []
+    if title:
+        parts.append(f"<b>{html.escape(title)}</b>")
+    if body:
+        parts.append(html.escape(body))
+    inner = "\n".join(parts)
+    if note:
+        inner += f"<small>{html.escape(note)}</small>"
+    st.html(f"<div class='bc-banner bc-{kind}'>{inner}</div>")
+
+
+def top_bar():
+    """Title on the left, ONE button on the right (Login or Logout)."""
+    left, right = st.columns([6, 1], vertical_alignment="center")
+    left.title("AI Customer Support Desk", anchor=False)
+    left.caption("Complaints are answered by four AI agents working in order, using BrightCart's own policies.")
+    page = st.session_state["page"]
+    if st.session_state.get("user"):
+        if right.button("Logout", width="stretch"):
+            st.session_state.pop("user")
+            go("customer")
+    elif page == "login":
+        if right.button("← Back", width="stretch"):
+            go("customer")
     else:
-        st.markdown(f"**{title}**")
-        st.bar_chart(series.value_counts())
+        if right.button("Login", type="primary", width="stretch"):
+            go("login")
 
 
-def render_donut_chart(series: pd.Series, title: str,
-                       color_map: dict | None = None) -> None:
-    if _PLOTLY and not series.empty:
-        df = series.value_counts().reset_index()
-        df.columns = ["label", "count"]
-        colors = [color_map.get(l, "#3b82f6") for l in df["label"]] if color_map else None
-        fig = go.Figure(go.Pie(
-            labels=df["label"], values=df["count"],
-            hole=0.55, marker_colors=colors,
-            textinfo="percent+label", textfont_size=11,
-        ))
-        fig.update_layout(
-            title=dict(text=title, font_size=13, font_color="#1e293b"),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font_family="Inter, sans-serif", margin=dict(l=0, r=0, t=28, b=0),
-            showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.markdown(f"**{title}**")
-        st.bar_chart(series.value_counts())
-
-
-# ── Top bar ───────────────────────────────────────────────────────────────────
-_tb_left, _tb_space, _tb_right = st.columns([4, 2, 1])
-
-with _tb_left:
-    if st.session_state.logged_in:
-        st.markdown(
-            '<span class="brand-name">🛒 BrightCart</span>'
-            '<span class="brand-badge">Helpdesk</span>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown('<span class="brand-name">🛒 BrightCart Support</span>',
-                    unsafe_allow_html=True)
-
-with _tb_right:
-    if st.session_state.logged_in:
-        if st.button("Logout", key="logout_btn", use_container_width=True):
-            st.session_state.logged_in          = False
-            st.session_state.show_login         = False
-            st.session_state.selected_ticket_id = None
-            st.rerun()
-    else:
-        _lbl = "✕ Cancel" if st.session_state.show_login else "Helpdesk Login"
-        if st.button(_lbl, key="login_btn", use_container_width=True):
-            st.session_state.show_login  = not st.session_state.show_login
-            st.session_state.login_error = ""
-            st.rerun()
-
-st.markdown('<hr style="border-color:#e2e8f0;margin:0 0 1.5rem;">', unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LOGIN FORM
-# ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.show_login and not st.session_state.logged_in:
-    _, col, _ = st.columns([2, 1, 2])
-    with col:
-        st.markdown('<div class="login-card">', unsafe_allow_html=True)
-        st.markdown('<div class="login-title">Helpdesk Login</div>', unsafe_allow_html=True)
-        st.markdown('<div class="login-sub">Enter your credentials to access the support desk</div>',
-                    unsafe_allow_html=True)
-
-        with st.form("login_form"):
-            username = st.text_input("Username", placeholder="e.g. helpdesk")
-            password = st.text_input("Password", type="password")
-            if st.session_state.login_error:
-                st.error(st.session_state.login_error)
-            ok = st.form_submit_button("Sign in", type="primary", use_container_width=True)
-
-        if ok:
-            if username == HELPDESK_USER and password == HELPDESK_PASS:
-                st.session_state.logged_in   = True
-                st.session_state.show_login  = False
-                st.session_state.login_error = ""
-                st.rerun()
+def sidebar():
+    """Shown on every page. The API key status is for signed-in staff only."""
+    with st.sidebar:
+        st.html("<div class='bc-brand'>🛒 BrightCart Support</div>")
+        user = st.session_state.get("user")
+        if user:
+            st.caption(f"Signed in as **{user}**")
+        st.html("<div class='bc-label'>How a complaint is handled</div>")
+        for icon, label, job in AGENTS.values():
+            st.markdown(f"**{icon} {label}**  \n<span class='step-desc'>{job}</span>", unsafe_allow_html=True)
+        st.divider()
+        st.html("<div class='bc-label'>Escalated when any is true</div>")
+        st.markdown("\n".join(f"- {rule}" for rule in RULES))
+        if user:
+            if os.getenv("OPENAI_API_KEY"):
+                banner("ok", body=f"API key loaded · model {MODEL}")
             else:
-                st.session_state.login_error = "Incorrect username or password."
-                st.rerun()
-
-        st.markdown('</div>', unsafe_allow_html=True)
+                banner("bad", body="OPENAI_API_KEY is not set.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CUSTOMER PAGE
-# ══════════════════════════════════════════════════════════════════════════════
-elif not st.session_state.logged_in:
-    _, center, _ = st.columns([1, 2, 1])
-    with center:
-        # ── Confirmation after submission ──
-        if st.session_state.last_submission_id:
-            tid = st.session_state.last_submission_id
-            st.markdown(
-                f'<div class="confirm-card">'
-                f'<div class="confirm-title">✅ Complaint received!</div>'
-                f'<div class="confirm-id">{tid}</div>'
-                f'<div class="confirm-sub">'
-                f'Our AI support team has reviewed your complaint and prepared a response. '
-                f'A member of our team will follow up if further action is needed.'
-                f'</div></div>',
-                unsafe_allow_html=True,
-            )
-            if st.button("Submit another complaint", key="new_complaint_btn"):
-                st.session_state.last_submission_id = None
-                st.session_state["complaint"]       = ""
-                st.rerun()
+def show_agent_steps(messages):
+    for message in messages:
+        icon, label, job = AGENTS.get(message["source"], ("🤖", message["source"], ""))
+        with st.container(border=True):
+            st.markdown(f"<span class='step-title'>{icon} {label} Agent</span> "
+                        f"<span class='step-desc'>· {job}</span>", unsafe_allow_html=True)
+            st.write(short_text(message["source"], message["content"]))
+            if len(message["content"]) > 200:
+                with st.expander("Full output"):
+                    st.text(message["content"])
 
-        # ── Submission form ──
+
+def show_result(ticket, where, steps=None):
+    """The result of one ticket. `where` keeps element keys unique across tabs."""
+    st.html(f"<div class='bc-heading'>Result for {html.escape(ticket['ticket_id'])}</div>")
+    reason = ticket["escalation_reason"]
+    if ticket["status"] == "Escalated":
+        banner("bad", "🔴 Escalated to human support", f"Reason: {reason}",
+               note="Next step: a support specialist should take over this ticket.")
+    elif ticket["status"] == "Resolved":
+        banner("ok", body="🟢 Resolved" if reason else "🟢 Resolved by the AI desk")
+    else:
+        banner("reply", body=f"Status: {ticket['status']}")
+
+    st.markdown("**Customer reply**")
+    banner("reply", body=ticket["response"])
+    if st.session_state.get("user"):
+        st.caption("Copy the reply below if you need to send it manually.")
+        st.code(ticket["response"], language=None, wrap_lines=True)
+
+    with st.container(key=f"result_stats_{where}"):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Category", ticket["category"])
+        m2.metric("Urgency", ticket["urgency"])
+        m3.metric("Sentiment", ticket["sentiment"])
+        m4.metric("Reply confidence", ticket["confidence"])
+
+    if steps:
+        st.markdown("**Agent steps**")
+        show_agent_steps(steps)
+
+    with st.expander("More details", expanded=True):
+        st.markdown(f"**Ticket ID:** {ticket['ticket_id']} · **Logged at:** {ticket['timestamp']}")
+        st.markdown(f"**Customer:** {ticket['customer_name'] or 'Not given'} · "
+                    f"**Order ID:** {ticket['order_id'] or 'Not given'}")
+        st.markdown(f"**Phone or mail ID:** {read_contact(ticket['ticket_id']) or 'Not given'}")
+        st.markdown(f"**Knowledge source:** {ticket['kb_sources'] or 'none'}")
+        st.markdown(f"**Summary:** {ticket['summary']}")
+        st.markdown(f"**Original complaint:** {ticket['complaint']}")
+
+
+def submit_complaint(customer_name, order_id, contact, complaint):
+    """Check the four mandatory fields, then run the agents. Reruns the page on success."""
+    problems = []
+    if not customer_name.strip():
+        problems.append("Please enter your name.")
+    if not order_id.strip():
+        problems.append("Please enter your order ID.")
+    if not contact.strip():
+        problems.append("Please enter your phone number or mail ID.")
+    elif not valid_contact(contact):
+        problems.append("Please enter a valid phone number or mail ID.")
+    if len(complaint.strip()) < 10:
+        problems.append("Please describe the problem in at least 10 characters.")
+    if problems:
+        for problem in problems:
+            st.error(problem)
+        return
+    if not os.getenv("OPENAI_API_KEY"):
+        st.error("The support desk is not set up yet (OPENAI_API_KEY is missing).")
+        return
+
+    with st.status("Our AI agents are reviewing your complaint...", expanded=True) as status:
+        def show_step(agent_name, text):
+            icon, label, _ = AGENTS.get(agent_name, ("🤖", agent_name, ""))
+            st.markdown(f"**{icon} {label} Agent**")
+            st.write(short_text(agent_name, text))
+
+        try:
+            # The contact is not part of the task, so it never reaches the AI model.
+            result = asyncio.run(run_ticket(customer_name, order_id, complaint, on_message=show_step))
+        except Exception as error:
+            status.update(label="Something went wrong", state="error")
+            st.error(f"Sorry, we could not process your complaint: {error}")
+            return
+        status.update(label="Done", state="complete", expanded=False)
+
+    save_contact(result["ticket_id"], contact)
+    st.session_state["confirmation_id"] = result["ticket_id"]
+    st.session_state["live_steps"] = result["messages"]
+    st.session_state["clear_form"] = True  # an empty form can't be submitted twice by accident
+    st.rerun()
+
+
+# ================================================================== PAGE 1: customer
+def complaint_section(where):
+    """The form, with the latest result under it. Also the helpdesk's New complaint tab."""
+    if st.session_state.pop("clear_form", False):
+        for key in FORM_KEYS:
+            st.session_state[key] = ""  # removing the key would leave the old text on screen
+
+    # Demo helper: fill the form with a sample complaint.
+    titles = [s["title"] for s in ALL_SAMPLES]
+    pick, button = st.columns([3, 1], vertical_alignment="bottom")
+    choice = pick.selectbox("Try a sample complaint", titles)
+    sample = ALL_SAMPLES[titles.index(choice)]
+    button.button("Load sample", on_click=load_sample, args=(sample,), width="stretch")
+
+    col1, col2, col3 = st.columns(3)
+    customer_name = col1.text_input("Your name (mandatory)", key="name", placeholder="e.g. Priya")
+    order_id = col2.text_input("Order ID (mandatory)", key="order", placeholder="e.g. ORD-4512")
+    contact = col3.text_input("Phone no or mail ID (mandatory)", key="contact",
+                              placeholder="e.g. 9876543210 or priya@example.com")
+    complaint = st.text_area("Describe your complaint (mandatory)", key="complaint", height=92,
+                             placeholder="What happened? Include dates and order details.")
+    st.caption(f"{len(complaint)} characters")
+
+    if st.button("Submit complaint", type="primary"):
+        submit_complaint(customer_name, order_id, contact, complaint)
+
+    done_id = st.session_state.get("confirmation_id")
+    if done_id:
+        st.divider()
+        ticket = find_ticket(done_id)
+        if ticket:
+            show_result(ticket, where, st.session_state.get("live_steps"))
         else:
-            st.markdown('<div class="hero-heading">How can we help you?</div>',
-                        unsafe_allow_html=True)
-            st.markdown('<div class="hero-sub">Submit your complaint and our support team will be in touch.</div>',
-                        unsafe_allow_html=True)
-
-            # Sample loader
-            s_col, b_col = st.columns([3, 1])
-            sample_choice = s_col.selectbox("Sample", list(SAMPLES), index=0,
-                                            label_visibility="collapsed")
-            if b_col.button("Try a sample", key="load_sample", use_container_width=True):
-                st.session_state["complaint"] = SAMPLES[sample_choice]
-                st.rerun()
-
-            with st.form("customer_form", clear_on_submit=False):
-                n_col, o_col = st.columns(2)
-                customer_name = n_col.text_input("Your name (optional)", placeholder="e.g. Priya")
-                order_id      = o_col.text_input("Order ID (optional)",  placeholder="e.g. ORD-4512")
-                complaint = st.text_area(
-                    "Describe your issue",
-                    key="complaint",
-                    height=150,
-                    placeholder="Tell us what happened in as much detail as you can…",
-                )
-                cc, sc = st.columns([3, 1])
-                cc.caption(f"{len(complaint)} characters")
-                submitted = sc.form_submit_button("Submit Complaint", type="primary",
-                                                  use_container_width=True)
-
-            if submitted:
-                if len(complaint.strip()) < 10:
-                    st.warning("Please describe your issue in at least 10 characters.")
-                else:
-                    with st.spinner("Reviewing your complaint — this takes a few seconds…"):
-                        try:
-                            result = asyncio.run(
-                                run_ticket(customer_name, order_id, complaint)
-                            )
-                            st.session_state.last_submission_id = result["ticket_id"]
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"Could not process your complaint: {exc}")
+            banner("ok", body=f"Complaint received. Your ticket number is {done_id}.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPDESK DASHBOARD
-# ══════════════════════════════════════════════════════════════════════════════
-else:
+def customer_page():
+    complaint_section("customer")
+
+
+# ================================================================== PAGE 2: login
+def login_page():
+    _, middle, _ = st.columns([1, 1.2, 1])
+    with middle:
+        st.subheader("🔐 Helpdesk Login")
+        st.caption("For BrightCart helpdesk team members only.")
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            ok = st.form_submit_button("Sign in", type="primary", width="stretch")
+        if USING_DEFAULT_LOGIN:
+            st.info("Demo login: **helpdesk** / **support123**. Set HELPDESK_USER and HELPDESK_PASS in .env to change it.")
+        if ok:
+            user_ok = hmac.compare_digest(username.encode(), HELPDESK_USER.encode())
+            pass_ok = hmac.compare_digest(password.encode(), HELPDESK_PASS.encode())
+            if user_ok and pass_ok:
+                st.session_state["user"] = username
+                go("helpdesk")
+            else:
+                st.error("Incorrect username or password.")
+
+
+# ================================================================== PAGE 3: helpdesk
+def helpdesk_page():
     tickets = read_tickets()
-    df_all  = pd.DataFrame(tickets) if tickets else pd.DataFrame(
-        columns=["ticket_id", "timestamp", "customer_name", "order_id",
-                 "complaint", "category", "urgency", "sentiment", "summary",
-                 "kb_sources", "response", "confidence", "status", "escalation_reason"]
-    )
+    total = len(tickets)
+    # A ticket keeps its escalation reason even after staff change its status.
+    escalated = sum(1 for t in tickets if t["escalation_reason"])
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Tickets logged", total)
+    m2.metric("Resolved by AI", total - escalated)
+    m3.metric("Escalated to humans", escalated)
+    m4.metric("Escalation rate", f"{round(100 * escalated / total) if total else 0}%")
 
-    # ── Stats ──
-    total      = len(df_all)
-    escalated  = int((df_all["status"] == "Escalated").sum())  if total else 0
-    open_c     = int((df_all["status"] == "Open").sum())        if total else 0
-    in_prog    = int((df_all["status"] == "In Progress").sum()) if total else 0
-    resolved   = int((df_all["status"] == "Resolved").sum())    if total else 0
-    closed     = int((df_all["status"] == "Closed").sum())      if total else 0
-
-    s1, s2, s3, s4, s5 = st.columns(5)
-    s1.metric("Total tickets",  total)
-    s2.metric("🔴 Escalated",   escalated)
-    s3.metric("🔵 Open",        open_c)
-    s4.metric("🟡 In Progress", in_prog)
-    s5.metric("🟢 Resolved",    resolved)
-
-    st.write("")
-
-    tab_tickets, tab_insights = st.tabs(["📋  All Tickets", "📊  Insights"])
-
-    # ── Tab 1: Ticket management ──────────────────────────────────────────────
-    with tab_tickets:
-        if df_all.empty:
-            st.info("No tickets yet. Customers can submit complaints on the main page.")
-        else:
-            # Filters
-            f1, f2, f3 = st.columns([1, 2, 2])
-            status_filter   = f1.selectbox("Status", ["All"] + ALL_STATUSES)
-            category_filter = f2.multiselect("Category",
-                                             sorted(df_all["category"].dropna().unique()))
-            search_text     = f3.text_input("Search", placeholder="Customer name, order ID, or keyword…")
-
-            filtered = df_all.copy()
-            if status_filter != "All":
-                filtered = filtered[filtered["status"] == status_filter]
-            if category_filter:
-                filtered = filtered[filtered["category"].isin(category_filter)]
-            if search_text.strip():
-                q    = search_text.strip()
-                mask = (
-                    filtered["complaint"].str.contains(q, case=False, na=False)
-                    | filtered["customer_name"].str.contains(q, case=False, na=False)
-                    | filtered["order_id"].str.contains(q, case=False, na=False)
-                    | filtered["response"].str.contains(q, case=False, na=False)
-                )
-                filtered = filtered[mask]
-
-            st.caption(f"Showing **{len(filtered)}** of **{total}** tickets")
-
-            # Table
-            DISPLAY = ["ticket_id", "timestamp", "customer_name", "order_id",
-                       "category", "urgency", "status", "summary"]
-            st.dataframe(
-                filtered[DISPLAY],
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "ticket_id":     st.column_config.TextColumn("Ticket ID",  width="small"),
-                    "timestamp":     st.column_config.TextColumn("Time",       width="medium"),
-                    "customer_name": st.column_config.TextColumn("Customer",   width="small"),
-                    "order_id":      st.column_config.TextColumn("Order",      width="small"),
-                    "category":      st.column_config.TextColumn("Category",   width="small"),
-                    "urgency":       st.column_config.TextColumn("Urgency",    width="small"),
-                    "status":        st.column_config.TextColumn("Status",     width="small"),
-                    "summary":       st.column_config.TextColumn("Summary"),
-                },
-            )
-
-            # Ticket selector
-            if not filtered.empty:
-                st.markdown("---")
-                st.markdown("**Select a ticket to review**")
-                chosen_id = st.selectbox(
-                    "Ticket", filtered["ticket_id"].tolist(),
-                    index=0, label_visibility="collapsed",
-                    key="ticket_selector",
-                )
-
-                ticket = next(
-                    (t for t in tickets if t["ticket_id"] == chosen_id), None
-                )
-                if ticket:
-                    st.markdown(f"### {chosen_id}")
-
-                    # ── Status update card ───────────────────────────────
-                    bg, fg, emoji = STATUS_STYLE.get(
-                        ticket["status"], ("#f1f5f9", "#475569", "⚪")
-                    )
-                    st.markdown(
-                        f'<div style="background:{bg};border:1px solid {fg}33;border-radius:10px;'
-                        f'padding:1rem 1.25rem;margin-bottom:1rem;">'
-                        f'<div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;'
-                        f'letter-spacing:0.07em;color:{fg};margin-bottom:0.5rem;">Current status</div>'
-                        f'<span class="sbadge" style="background:{bg};color:{fg};font-size:0.85rem;">'
-                        f'{emoji} {ticket["status"]}</span>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                    u_col, b_col = st.columns([2, 1])
-                    new_status = u_col.selectbox(
-                        "Update status to",
-                        ALL_STATUSES,
-                        index=ALL_STATUSES.index(ticket["status"])
-                              if ticket["status"] in ALL_STATUSES else 0,
-                        key=f"status_sel_{chosen_id}",
-                    )
-                    b_col.write("")          # vertical alignment nudge
-                    b_col.write("")
-                    if b_col.button("Update Status", key=f"update_btn_{chosen_id}",
-                                    use_container_width=True, type="primary"):
-                        if update_ticket_status(chosen_id, new_status):
-                            st.toast(f"{chosen_id} status updated to {new_status}", icon="✅")
-                            st.rerun()
-                        else:
-                            st.error("Could not update status. Ticket not found.")
-
-                    # ── Ticket details ───────────────────────────────────
-                    st.markdown("**Ticket details**")
-                    pairs = [
-                        ("Ticket ID",        ticket["ticket_id"]),
-                        ("Logged at",        ticket["timestamp"]),
-                        ("Customer",         ticket["customer_name"] or "Not given"),
-                        ("Order ID",         ticket["order_id"]      or "Not given"),
-                        ("Category",         ticket["category"]      or "—"),
-                        ("Urgency",          ticket["urgency"]       or "—"),
-                        ("Sentiment",        ticket["sentiment"]     or "—"),
-                        ("Confidence",       ticket["confidence"]    or "—"),
-                        ("Knowledge source", ticket["kb_sources"]    or "None found"),
-                    ]
-                    for key, val in pairs:
-                        st.markdown(
-                            f'<div class="detail-row">'
-                            f'<span class="detail-key">{key}</span>'
-                            f'<span class="detail-val">{val}</span>'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                    if ticket.get("escalation_reason"):
-                        st.warning(f"**Escalation reason:** {ticket['escalation_reason']}")
-
-                    st.markdown("**Summary**")
-                    st.info(ticket["summary"])
-
-                    st.markdown("**AI-generated reply**")
-                    st.info(ticket["response"])
-                    st.code(ticket["response"], language=None)
-
-                    with st.expander("Original complaint"):
-                        st.write(ticket["complaint"])
-
-            # ── Downloads ──
-            st.write("")
-            d1, d2 = st.columns(2)
-            d1.download_button(
-                "⬇  Download filtered view (CSV)",
-                data=filtered.to_csv(index=False).encode("utf-8") if not filtered.empty else b"",
-                file_name="tickets_filtered.csv",
-                mime="text/csv",
-                disabled=filtered.empty,
-            )
-            d2.download_button(
-                "⬇  Download full log (CSV)",
-                data=LOG_FILE.read_bytes() if LOG_FILE.exists() else b"",
-                file_name="tickets_all.csv",
-                mime="text/csv",
-                disabled=not LOG_FILE.exists(),
-            )
-
-    # ── Tab 2: Insights ───────────────────────────────────────────────────────
+    new_label, log_label, insights_label = "✍️ New complaint", "📋 Ticket log", "📊 Insights"
+    tab_new, tab_log, tab_insights = st.tabs([new_label, log_label, insights_label], default=log_label)
+    with tab_new:
+        complaint_section("new_tab")
+    with tab_log:
+        ticket_log_tab(tickets)
     with tab_insights:
-        if df_all.empty:
-            st.info("Charts appear once tickets have been logged.")
+        insights_tab(tickets)
+
+
+def ticket_log_tab(tickets):
+    if not tickets:
+        st.info("No complaints yet. They appear here as customers submit them.")
+        return
+
+    df = pd.DataFrame(tickets)
+    f1, f2, f3 = st.columns([1, 2, 2])
+    status_filter = f1.selectbox("Status", ["All"] + VALID_STATUSES)
+    category_filter = f2.multiselect("Category", sorted(df["category"].dropna().unique()),
+                                     placeholder="Select categories")
+    search = f3.text_input("Search name, order, complaint or reply", placeholder="e.g. refund")
+
+    shown = df
+    if status_filter != "All":
+        shown = shown[shown["status"] == status_filter]
+    if category_filter:
+        shown = shown[shown["category"].isin(category_filter)]
+    if search.strip():
+        text = search.strip()
+        mask = pd.Series(False, index=shown.index)
+        for column in ["customer_name", "order_id", "complaint", "response"]:
+            mask = mask | shown[column].str.contains(text, case=False, na=False, regex=False)
+        shown = shown[mask]
+
+    st.caption(f"Showing {len(shown)} of {len(df)} tickets")
+    columns = ["ticket_id", "timestamp", "customer_name", "order_id",
+               "category", "urgency", "status", "summary"]
+    st.dataframe(shown.iloc[::-1][columns].style.map(colour_status, subset=["status"]),
+                 hide_index=True, width="stretch")
+
+    d1, d2, _ = st.columns(3)
+    d1.download_button("Download filtered view (CSV)", shown.to_csv(index=False),
+                       file_name="tickets_filtered.csv", mime="text/csv",
+                       disabled=shown.empty, width="stretch")
+    d2.download_button("Download full log (CSV)", LOG_FILE.read_bytes(),
+                       file_name="tickets.csv", mime="text/csv", width="stretch")
+
+    if shown.empty:
+        return
+    st.divider()
+    ticket_id = st.selectbox("Open a complaint", shown["ticket_id"].tolist()[::-1])
+    ticket_details(find_ticket(ticket_id))
+
+
+def ticket_details(ticket):
+    show_result(ticket, "log_tab")
+
+    # ---- take action + update status
+    st.markdown("### Take action")
+    with st.form(f"action_form_{ticket['ticket_id']}", clear_on_submit=True):
+        new_status = st.selectbox("Update status", VALID_STATUSES,
+                                  index=VALID_STATUSES.index(ticket["status"])
+                                  if ticket["status"] in VALID_STATUSES else 0)
+        action_taken = st.text_area("Action taken", placeholder="e.g. Called the customer and arranged a replacement.")
+        save = st.form_submit_button("Save action", type="primary")
+    if save:
+        if not action_taken.strip() and new_status == ticket["status"]:
+            st.warning("Write the action you took or choose a new status.")
+        elif record_action(ticket["ticket_id"], st.session_state["user"], new_status, action_taken):
+            st.toast(f"{ticket['ticket_id']} saved as {new_status}", icon="✅")
+            st.rerun()
         else:
-            r1, r2 = st.columns(2)
-            with r1:
-                render_bar_chart(df_all["category"], "Complaints by category")
-            with r2:
-                render_bar_chart(df_all["urgency"],  "Urgency breakdown")
+            st.error("Could not save the action. Please try again.")
 
-            r3, r4 = st.columns(2)
-            with r3:
-                render_donut_chart(
-                    df_all["status"], "Ticket status distribution",
-                    color_map={
-                        "Resolved":    "#22c55e",
-                        "Escalated":   "#ef4444",
-                        "Open":        "#3b82f6",
-                        "In Progress": "#eab308",
-                        "Closed":      "#94a3b8",
-                    },
-                )
-            with r4:
-                reasons = (
-                    df_all.loc[df_all["escalation_reason"].str.strip().ne(""), "escalation_reason"]
-                    .str.split("; ").explode().dropna()
-                )
-                if reasons.empty:
-                    st.info("No escalation data yet.")
-                else:
-                    render_bar_chart(reasons, "Escalation reasons")
+    history = read_actions(ticket["ticket_id"])
+    st.markdown("**Action history**")
+    if history:
+        st.dataframe(pd.DataFrame(history).rename(columns={
+            "timestamp": "When", "helpdesk_user": "By", "new_status": "Status", "action_taken": "Action"
+        })[["When", "By", "Status", "Action"]], hide_index=True, width="stretch")
+    else:
+        st.caption("No actions recorded yet.")
 
-            st.write("")
-            render_bar_chart(df_all["sentiment"], "Customer sentiment")
+
+def insights_tab(tickets):
+    if not tickets:
+        st.info("Charts appear after the first ticket is logged.")
+        return
+    df = pd.DataFrame(tickets)
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Tickets by category**")
+        st.bar_chart(df["category"].value_counts())
+    with right:
+        st.markdown("**Tickets by status**")
+        st.bar_chart(df["status"].value_counts())
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Tickets by urgency**")
+        st.bar_chart(df["urgency"].value_counts().reindex(["Low", "Medium", "High"], fill_value=0))
+    with right:
+        st.markdown("**Why tickets were escalated**")
+        reasons = (df["escalation_reason"].dropna().str.split("; ").explode()
+                   .loc[lambda s: s != ""].value_counts())
+        if reasons.empty:
+            st.caption("No escalations yet.")
+        else:
+            st.bar_chart(reasons)
+
+
+# ================================================================== router
+page = st.session_state["page"]
+
+# The helpdesk page is only available after logging in.
+if page == "helpdesk" and not st.session_state.get("user"):
+    page = st.session_state["page"] = "login"
+
+sidebar()
+top_bar()
+
+if page == "login":
+    login_page()
+elif page == "helpdesk":
+    helpdesk_page()
+else:
+    customer_page()

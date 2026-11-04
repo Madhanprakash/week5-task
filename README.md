@@ -72,7 +72,7 @@ OPENAI_MODEL=gpt-4o-mini
 streamlit run app.py
 ```
 
-Open the URL Streamlit prints (usually http://localhost:8501), enter a complaint and press **Submit complaint**.
+Open the URL Streamlit prints (usually http://localhost:8501), fill in the four mandatory fields (name, order ID, phone or mail ID, complaint) and press **Submit complaint**.
 
 - **Agent steps** appear live, one section per agent.
 - **Customer reply** is shown in a highlighted box with a green *Resolved* or red *Escalated* badge.
@@ -83,6 +83,8 @@ Open the URL Streamlit prints (usually http://localhost:8501), enter a complaint
 Each complaint adds one row to `logs/tickets.csv` (created automatically):
 
 `ticket_id, timestamp, customer_name, order_id, complaint, category, urgency, sentiment, summary, kb_sources, response, confidence, status, escalation_reason`
+
+The customer's phone number or mail ID is saved separately in `logs/contacts.csv` (`ticket_id, contact`) and is not sent to the AI model.
 
 ## Test cases
 
@@ -97,7 +99,7 @@ Each complaint adds one row to `logs/tickets.csv` (created automatically):
 | 7 | *(your own test)* | | `screenshots/` |
 | 8 | *(your own test)* | | `screenshots/` |
 
-The keyword search and escalation rules were checked against cases 1–6 without an API key. Cases 1–6 still need to be run end to end with a real key to confirm the LLM steps.
+Retrieval (with the agent-style queries "order arrive yesterday", "return refund", "forgot password login", "broken replacement", "charged more than once") and the escalation rules were checked without an API key. Cases 1–6 still need to be run end to end and screenshotted.
 
 ## Project structure
 
@@ -124,4 +126,4 @@ customer-support-agents/
 ## Notes and limitations
 - Retrieval uses keyword matching. Embeddings with ChromaDB or FAISS are a possible upgrade.
 - The model is set by `OPENAI_MODEL`. Other providers need a different AutoGen model client, and non-OpenAI model names may need a `model_info` entry.
-- The escalation keyword list is short by design. "charged" is included, so a complaint about an unexpected delivery charge will also be escalated. Adjust `PAYMENT_LEGAL_PATTERN` in `agents/ticket_store.py` if that is too strict.
+- The escalation keyword list is short by design. "charged" is included, so a complaint that says a card was "charged" will be escalated; the word "charge" alone (e.g. "delivery charge") is not matched. Adjust `PAYMENT_LEGAL_PATTERN` in `agents/ticket_store.py` if that is too strict.
