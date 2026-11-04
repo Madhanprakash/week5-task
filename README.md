@@ -74,9 +74,8 @@ streamlit run app.py
 
 Open the URL Streamlit prints (usually http://localhost:8501), fill in the four mandatory fields (name, order ID, phone or mail ID, complaint) and press **Submit complaint**.
 
-- **Agent steps** appear live, one section per agent.
-- **Customer reply** is shown in a highlighted box with a green *Resolved* or red *Escalated* badge.
-- **Ticket Log** shows every row in `logs/tickets.csv` and lets you download it.
+- **Customers** see one AI assistant at work, then a **summary report**: status, their complaint in brief and the reply.
+- **Helpdesk staff** log in to see the **Ticket log**, which opens on escalated tickets. Each ticket has a **reply mail** filled in from the AI reply, which staff can edit, save and open in their mail app. The app does not send mail itself.
 
 ## Log file
 
@@ -84,7 +83,7 @@ Each complaint adds one row to `logs/tickets.csv` (created automatically):
 
 `ticket_id, timestamp, customer_name, order_id, complaint, category, urgency, sentiment, summary, kb_sources, response, confidence, status, escalation_reason`
 
-The customer's phone number or mail ID is saved separately in `logs/contacts.csv` (`ticket_id, contact`) and is not sent to the AI model.
+The customer's phone number or mail ID is saved separately in `logs/contacts.csv` (`ticket_id, contact`) and is not sent to the AI model. Saved reply mails are in `logs/reply_mails.csv`.
 
 ## Test cases
 

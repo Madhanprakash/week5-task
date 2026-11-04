@@ -60,5 +60,18 @@ print("\nSamples fill every mandatory field")
 for s in ALL_SAMPLES:
     check(s["title"], all(s[k].strip() for k in ["name", "order_id", "complaint"]) and valid_contact(s["contact"]))
 
+print("\nReply mail")
+import tempfile
+from pathlib import Path
+
+import agents.ticket_store as store
+
+store.REPLY_MAILS_FILE = Path(tempfile.mkdtemp()) / "reply_mails.csv"
+check("no reply mail yet", store.read_reply_mail("TKT-1") is None)
+store.save_reply_mail("TKT-1", "helpdesk", "first")
+store.save_reply_mail("TKT-1", "helpdesk", "second, with a comma\nand a new line")
+store.save_reply_mail("TKT-2", "helpdesk", "other ticket")
+check("latest save wins", store.read_reply_mail("TKT-1")["reply"] == "second, with a comma\nand a new line")
+
 print(f"\n{passed} passed, {failed} failed")
 raise SystemExit(1 if failed else 0)

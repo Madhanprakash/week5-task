@@ -161,3 +161,35 @@ def read_contact(ticket_id: str) -> str:
     with CONTACTS_FILE.open(newline="", encoding="utf-8") as f:
         matches = [r["contact"] for r in csv.DictReader(f) if r["ticket_id"] == ticket_id]
     return matches[-1] if matches else ""
+
+
+# ---- Reply mails ------------------------------------------------------------
+# What the helpdesk wrote back to the requester. Every save is kept; the last one counts.
+REPLY_MAILS_FILE = LOG_FILE.parent / "reply_mails.csv"
+REPLY_MAIL_COLUMNS = ["ticket_id", "timestamp", "helpdesk_user", "reply"]
+
+
+def save_reply_mail(ticket_id: str, helpdesk_user: str, reply: str) -> None:
+    from datetime import datetime
+
+    REPLY_MAILS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    is_new = not REPLY_MAILS_FILE.exists() or REPLY_MAILS_FILE.stat().st_size == 0
+    with REPLY_MAILS_FILE.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=REPLY_MAIL_COLUMNS)
+        if is_new:
+            writer.writeheader()
+        writer.writerow({
+            "ticket_id": ticket_id,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "helpdesk_user": helpdesk_user,
+            "reply": reply.strip(),
+        })
+
+
+def read_reply_mail(ticket_id: str) -> dict | None:
+    """The latest saved reply mail for a ticket, or None."""
+    if not REPLY_MAILS_FILE.exists():
+        return None
+    with REPLY_MAILS_FILE.open(newline="", encoding="utf-8") as f:
+        matches = [r for r in csv.DictReader(f) if r["ticket_id"] == ticket_id]
+    return matches[-1] if matches else None

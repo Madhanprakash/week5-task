@@ -3,22 +3,24 @@
 Run with:  streamlit run app.py
 
 Pages (kept in st.session_state["page"]):
-  customer  - complaint form + confirmation (what customers see)
+  customer  - complaint form + summary report (all that customers see)
   login     - helpdesk sign in
-  helpdesk  - all tickets, ticket details, actions and status updates
+  helpdesk  - all tickets, ticket details, reply mail, actions and status updates
 """
 import asyncio
 import hmac
 import html
 import os
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
 from agents.ticket_store import (LOG_FILE, VALID_STATUSES, read_actions,
-                                 read_contact, read_tickets, record_action,
-                                 save_contact, valid_contact)
+                                 read_contact, read_reply_mail, read_tickets,
+                                 record_action, save_contact, save_reply_mail,
+                                 valid_contact)
 from sample_complaints import ALL_SAMPLES
 from team import run_ticket
 
@@ -32,12 +34,6 @@ HELPDESK_USER = os.getenv("HELPDESK_USER", "helpdesk")
 HELPDESK_PASS = os.getenv("HELPDESK_PASS", "support123")
 USING_DEFAULT_LOGIN = "HELPDESK_PASS" not in os.environ
 
-AGENTS = {
-    "QueryAgent": ("🔎", "Query", "Reads the complaint and finds the category, urgency and mood"),
-    "KnowledgeAgent": ("📚", "Knowledge", "Searches the company documents"),
-    "ResolutionAgent": ("✍️", "Resolution", "Writes the reply using only policy facts"),
-    "LogAgent": ("🗂️", "Log", "Saves the ticket and applies the escalation rules"),
-}
 RULES = [
     "Urgency is High",
     "Customer is very angry",
@@ -87,8 +83,6 @@ h1 { font-size: 34px !important; font-weight: 700 !important; padding: 0 !import
 .bc-ok { background: #DAFBE1; color: #116329; font-weight: 600; }
 .bc-bad { background: #FFEBE9; color: #82071E; border-left: 4px solid #CF222E; }
 .bc-reply { background: #DDF4FF; color: #0A3069; }
-.step-title { font-weight: 600; }
-.step-desc { color: #57606A; font-size: 0.85rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -107,14 +101,6 @@ def find_ticket(ticket_id):
         if row["ticket_id"] == ticket_id:
             return row
     return None
-
-
-def short_text(agent, text):
-    """One-line version of an agent message for the step cards."""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if agent == "QueryAgent":
-        return " · ".join(lines)
-    return lines[0] if lines else ""
 
 
 def colour_status(value):
@@ -146,7 +132,7 @@ def top_bar():
     """Title on the left, ONE button on the right (Login or Logout)."""
     left, right = st.columns([6, 1], vertical_alignment="center")
     left.title("AI Customer Support Desk", anchor=False)
-    left.caption("Complaints are answered by four AI agents working in order, using BrightCart's own policies.")
+    left.caption("Complaints are answered by our AI support assistant, using BrightCart's own policies.")
     page = st.session_state["page"]
     if st.session_state.get("user"):
         if right.button("Logout", width="stretch"):
@@ -161,39 +147,40 @@ def top_bar():
 
 
 def sidebar():
-    """Shown on every page. The API key status is for signed-in staff only."""
+    """Customers see one line about the assistant. Staff also see the rules and API status."""
     with st.sidebar:
         st.html("<div class='bc-brand'>🛒 BrightCart Support</div>")
         user = st.session_state.get("user")
-        if user:
-            st.caption(f"Signed in as **{user}**")
-        st.html("<div class='bc-label'>How a complaint is handled</div>")
-        for icon, label, job in AGENTS.values():
-            st.markdown(f"**{icon} {label}**  \n<span class='step-desc'>{job}</span>", unsafe_allow_html=True)
-        st.divider()
+        if not user:
+            st.caption("Our AI support assistant reads your complaint and replies using BrightCart's policies.")
+            return
+        st.caption(f"Signed in as **{user}**")
         st.html("<div class='bc-label'>Escalated when any is true</div>")
         st.markdown("\n".join(f"- {rule}" for rule in RULES))
-        if user:
-            if os.getenv("OPENAI_API_KEY"):
-                banner("ok", body=f"API key loaded · model {MODEL}")
-            else:
-                banner("bad", body="OPENAI_API_KEY is not set.")
+        if os.getenv("OPENAI_API_KEY"):
+            banner("ok", body=f"API key loaded · model {MODEL}")
+        else:
+            banner("bad", body="OPENAI_API_KEY is not set.")
 
 
-def show_agent_steps(messages):
-    for message in messages:
-        icon, label, job = AGENTS.get(message["source"], ("🤖", message["source"], ""))
-        with st.container(border=True):
-            st.markdown(f"<span class='step-title'>{icon} {label} Agent</span> "
-                        f"<span class='step-desc'>· {job}</span>", unsafe_allow_html=True)
-            st.write(short_text(message["source"], message["content"]))
-            if len(message["content"]) > 200:
-                with st.expander("Full output"):
-                    st.text(message["content"])
+def customer_summary(ticket):
+    """The summary report: the only ticket information a customer sees."""
+    st.html(f"<div class='bc-heading'>Summary report for {html.escape(ticket['ticket_id'])}</div>")
+    if ticket["status"] in ("Resolved", "Closed"):
+        banner("ok", body=f"🟢 {ticket['status']}")
+    elif ticket["status"] == "Escalated":
+        banner("reply", body="Our support team is looking at your complaint and will follow up with you.")
+    else:
+        banner("reply", body=f"Status: {ticket['status']}")
+    st.markdown("**Your complaint in brief**")
+    st.write(ticket["summary"])
+    st.markdown("**Our reply**")
+    saved = read_reply_mail(ticket["ticket_id"])
+    banner("reply", body=saved["reply"] if saved else ticket["response"])
 
 
-def show_result(ticket, where, steps=None):
-    """The result of one ticket. `where` keeps element keys unique across tabs."""
+def show_result(ticket):
+    """The full ticket, for helpdesk staff."""
     st.html(f"<div class='bc-heading'>Result for {html.escape(ticket['ticket_id'])}</div>")
     reason = ticket["escalation_reason"]
     if ticket["status"] == "Escalated":
@@ -204,22 +191,12 @@ def show_result(ticket, where, steps=None):
     else:
         banner("reply", body=f"Status: {ticket['status']}")
 
-    st.markdown("**Customer reply**")
-    banner("reply", body=ticket["response"])
-    if st.session_state.get("user"):
-        st.caption("Copy the reply below if you need to send it manually.")
-        st.code(ticket["response"], language=None, wrap_lines=True)
-
-    with st.container(key=f"result_stats_{where}"):
+    with st.container(key="result_stats"):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Category", ticket["category"])
         m2.metric("Urgency", ticket["urgency"])
         m3.metric("Sentiment", ticket["sentiment"])
         m4.metric("Reply confidence", ticket["confidence"])
-
-    if steps:
-        st.markdown("**Agent steps**")
-        show_agent_steps(steps)
 
     with st.expander("More details", expanded=True):
         st.markdown(f"**Ticket ID:** {ticket['ticket_id']} · **Logged at:** {ticket['timestamp']}")
@@ -231,8 +208,38 @@ def show_result(ticket, where, steps=None):
         st.markdown(f"**Original complaint:** {ticket['complaint']}")
 
 
+def reply_mail_section(ticket):
+    """Reply to the requester, filled in automatically from the AI reply. Staff can edit it."""
+    ticket_id = ticket["ticket_id"]
+    contact = read_contact(ticket_id)
+    saved = read_reply_mail(ticket_id)
+
+    st.markdown("### Reply mail to the requester")
+    st.caption(f"To: {contact or 'No phone or mail ID saved for this ticket'}")
+    reply = st.text_area("Mail content", value=saved["reply"] if saved else ticket["response"],
+                         key=f"reply_mail_{ticket_id}", height=220)
+    if st.button("Save reply mail", type="primary"):
+        if reply.strip():
+            save_reply_mail(ticket_id, st.session_state["user"], reply)
+            st.toast(f"Reply mail saved for {ticket_id}", icon="✅")
+            st.rerun()
+        else:
+            st.warning("The mail content is empty.")
+
+    if not saved:
+        st.caption("Not saved yet. This is the AI's reply.")
+        return
+    st.caption(f"Last saved by {saved['helpdesk_user']} at {saved['timestamp']}.")
+    if "@" in contact:
+        subject = f"BrightCart Support: your ticket {ticket_id}"
+        url = f"mailto:{quote(contact, safe='@')}?subject={quote(subject)}&body={quote(saved['reply'])}"
+        st.link_button("Open saved mail in mail app", url)
+    elif contact:
+        st.caption(f"The customer gave a phone number. Call or text {contact} with this reply.")
+
+
 def submit_complaint(customer_name, order_id, contact, complaint):
-    """Check the four mandatory fields, then run the agents. Reruns the page on success."""
+    """Check the four mandatory fields, then run the AI. Reruns the page on success."""
     problems = []
     if not customer_name.strip():
         problems.append("Please enter your name.")
@@ -252,31 +259,23 @@ def submit_complaint(customer_name, order_id, contact, complaint):
         st.error("The support desk is not set up yet (OPENAI_API_KEY is missing).")
         return
 
-    with st.status("Our AI agents are reviewing your complaint...", expanded=True) as status:
-        def show_step(agent_name, text):
-            icon, label, _ = AGENTS.get(agent_name, ("🤖", agent_name, ""))
-            st.markdown(f"**{icon} {label} Agent**")
-            st.write(short_text(agent_name, text))
-
+    with st.spinner("Our AI assistant is reviewing your complaint..."):
         try:
             # The contact is not part of the task, so it never reaches the AI model.
-            result = asyncio.run(run_ticket(customer_name, order_id, complaint, on_message=show_step))
+            result = asyncio.run(run_ticket(customer_name, order_id, complaint))
         except Exception as error:
-            status.update(label="Something went wrong", state="error")
             st.error(f"Sorry, we could not process your complaint: {error}")
             return
-        status.update(label="Done", state="complete", expanded=False)
 
     save_contact(result["ticket_id"], contact)
     st.session_state["confirmation_id"] = result["ticket_id"]
-    st.session_state["live_steps"] = result["messages"]
     st.session_state["clear_form"] = True  # an empty form can't be submitted twice by accident
     st.rerun()
 
 
 # ================================================================== PAGE 1: customer
-def complaint_section(where):
-    """The form, with the latest result under it. Also the helpdesk's New complaint tab."""
+def complaint_section():
+    """The form, with the summary report under it. Also the helpdesk's New complaint tab."""
     if st.session_state.pop("clear_form", False):
         for key in FORM_KEYS:
             st.session_state[key] = ""  # removing the key would leave the old text on screen
@@ -305,13 +304,13 @@ def complaint_section(where):
         st.divider()
         ticket = find_ticket(done_id)
         if ticket:
-            show_result(ticket, where, st.session_state.get("live_steps"))
+            customer_summary(ticket)
         else:
             banner("ok", body=f"Complaint received. Your ticket number is {done_id}.")
 
 
 def customer_page():
-    complaint_section("customer")
+    complaint_section()
 
 
 # ================================================================== PAGE 2: login
@@ -325,7 +324,7 @@ def login_page():
             password = st.text_input("Password", type="password")
             ok = st.form_submit_button("Sign in", type="primary", width="stretch")
         if USING_DEFAULT_LOGIN:
-            st.info("Demo login: **helpdesk** / **support123**. Set HELPDESK_USER and HELPDESK_PASS in .env to change it.")
+            st.info("Demo login: **helpdesk** / **support123**.")
         if ok:
             user_ok = hmac.compare_digest(username.encode(), HELPDESK_USER.encode())
             pass_ok = hmac.compare_digest(password.encode(), HELPDESK_PASS.encode())
@@ -351,7 +350,7 @@ def helpdesk_page():
     new_label, log_label, insights_label = "✍️ New complaint", "📋 Ticket log", "📊 Insights"
     tab_new, tab_log, tab_insights = st.tabs([new_label, log_label, insights_label], default=log_label)
     with tab_new:
-        complaint_section("new_tab")
+        complaint_section()
     with tab_log:
         ticket_log_tab(tickets)
     with tab_insights:
@@ -365,7 +364,8 @@ def ticket_log_tab(tickets):
 
     df = pd.DataFrame(tickets)
     f1, f2, f3 = st.columns([1, 2, 2])
-    status_filter = f1.selectbox("Status", ["All"] + VALID_STATUSES)
+    # Opens on escalated tickets, so the newest one is chosen automatically below.
+    status_filter = f1.selectbox("Status", ["All"] + VALID_STATUSES, index=VALID_STATUSES.index("Escalated") + 1)
     category_filter = f2.multiselect("Category", sorted(df["category"].dropna().unique()),
                                      placeholder="Select categories")
     search = f3.text_input("Search name, order, complaint or reply", placeholder="e.g. refund")
@@ -384,7 +384,7 @@ def ticket_log_tab(tickets):
 
     st.caption(f"Showing {len(shown)} of {len(df)} tickets")
     columns = ["ticket_id", "timestamp", "customer_name", "order_id",
-               "category", "urgency", "status", "summary"]
+               "category", "urgency", "status", "escalation_reason", "summary"]
     st.dataframe(shown.iloc[::-1][columns].style.map(colour_status, subset=["status"]),
                  hide_index=True, width="stretch")
 
@@ -403,7 +403,8 @@ def ticket_log_tab(tickets):
 
 
 def ticket_details(ticket):
-    show_result(ticket, "log_tab")
+    show_result(ticket)
+    reply_mail_section(ticket)
 
     # ---- take action + update status
     st.markdown("### Take action")
