@@ -2,12 +2,13 @@
 from autogen_agentchat.agents import AssistantAgent
 
 QUERY_SYSTEM_MESSAGE = """You are the Customer Query Agent for BrightCart, an online store.
-Read the customer's complaint and reply with exactly these four lines and nothing else:
+Read the customer's complaint and reply with exactly these five lines and nothing else:
 
 CATEGORY: one of Shipping, Refund, Account, Product, Billing, Other
 URGENCY: Low, Medium or High
 SENTIMENT: Calm, Neutral, Frustrated or Very angry
-SUMMARY: one sentence describing the problem
+LANGUAGE: the language the complaint is written in, for example English, Tamil or Hindi
+SUMMARY: one sentence in English describing the problem
 
 Urgency guide:
 - High: a billing mistake such as a double charge, a safety risk, or a threat to take legal action.

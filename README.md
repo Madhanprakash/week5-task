@@ -77,6 +77,13 @@ Open the URL Streamlit prints (usually http://localhost:8501), fill in the four 
 - **Customers** see one AI assistant at work, then a **summary report**: status, their complaint in brief and the reply.
 - **Helpdesk staff** log in to see the **Ticket log**, which opens on escalated tickets. Each ticket has a **reply mail** filled in from the AI reply, which staff can edit, save and open in their mail app. The app does not send mail itself.
 
+## Human-style support behaviour
+
+- **Replies** acknowledge the customer's actual problem, match their mood, reply in their language and say what happens next. The assistant signs as an AI and never claims actions it cannot take.
+- **Talk to a person:** customers can ask for a person in their complaint, or with a button under a resolved reply.
+- **Handoff brief:** staff see what the customer needs, a suggested first step, tone notes and other tickets with the same order or contact.
+- **First reply targets:** the ticket grid shows what is due or overdue. Change the targets in `FIRST_REPLY_HOURS` in `agents/ticket_store.py`.
+
 ## Log file
 
 Each complaint adds one row to `logs/tickets.csv` (created automatically):

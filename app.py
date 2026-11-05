@@ -17,10 +17,11 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from agents.ticket_store import (LOG_FILE, VALID_STATUSES, read_actions,
-                                 read_contact, read_reply_mail, read_tickets,
-                                 record_action, save_contact, save_reply_mail,
-                                 valid_contact)
+from agents.ticket_store import (LOG_FILE, VALID_STATUSES, WAITING_STATUSES,
+                                 first_reply_hours, read_actions, read_contact,
+                                 read_reply_mail, read_tickets, record_action,
+                                 related_tickets, reply_clock, request_human,
+                                 save_contact, save_reply_mail, valid_contact)
 from sample_complaints import ALL_SAMPLES
 from team import run_ticket
 
@@ -40,7 +41,16 @@ RULES = [
     "No matching company document",
     "Legal threat, fraud or payment dispute",
     "Reply confidence is Low",
+    "Customer asks for a person",
 ]
+# The first thing an experienced colleague would check, by ticket category.
+FIRST_STEPS = {
+    "Shipping": "Check the carrier tracking for this order and open a trace if it is late.",
+    "Refund": "Check whether the return was scanned at the warehouse and where the refund has got to.",
+    "Billing": "Check the payment records for this order and confirm what was actually charged.",
+    "Account": "Confirm the customer's identity before changing anything on the account.",
+    "Product": "Check the customer's photos, then offer a replacement or a refund.",
+}
 FORM_KEYS = ["name", "order", "contact", "complaint"]
 STATUS_COLOURS = {
     "Escalated": "background-color:#FFEBE9;color:#82071E;font-weight:600",
@@ -169,7 +179,8 @@ def customer_summary(ticket):
     if ticket["status"] in ("Resolved", "Closed"):
         banner("ok", body=f"🟢 {ticket['status']}")
     elif ticket["status"] == "Escalated":
-        banner("reply", body="Our support team is looking at your complaint and will follow up with you.")
+        banner("reply", body="Our support team is looking at your complaint and will follow up with you.",
+               note=f"We aim to reply within {first_reply_hours(ticket['urgency'])} hours.")
     else:
         banner("reply", body=f"Status: {ticket['status']}")
     st.markdown("**Your complaint in brief**")
@@ -177,6 +188,32 @@ def customer_summary(ticket):
     st.markdown("**Our reply**")
     saved = read_reply_mail(ticket["ticket_id"])
     banner("reply", body=saved["reply"] if saved else ticket["response"])
+    if ticket["status"] == "Resolved" and st.button("This didn't solve it, talk to a person"):
+        request_human(ticket["ticket_id"])
+        st.rerun()
+
+
+def handoff_brief(ticket):
+    """Everything a person needs to take over, so the customer never has to repeat themselves."""
+    st.markdown("### Handoff brief")
+    actions = read_actions(ticket["ticket_id"])
+    st.markdown(f"**First reply:** {reply_clock(ticket, actions, read_reply_mail(ticket['ticket_id']))}")
+    st.markdown(f"**What they need:** {ticket['summary']}")
+    first_step = FIRST_STEPS.get(ticket["category"], "Read the complaint and decide who should own it.")
+    st.markdown(f"**Suggested first step:** {first_step}")
+    if "very angry" in ticket["sentiment"].lower():
+        st.markdown("**Tone:** Acknowledge their frustration first. Call them if they gave a phone number.")
+    if "legal" in ticket["escalation_reason"].lower():
+        st.markdown("**Care:** Possible legal threat, fraud or payment dispute. "
+                    "Ask a senior specialist before promising anything.")
+
+    others = related_tickets(ticket)
+    if others:
+        st.markdown(f"**Same order or contact:** {len(others)} other ticket(s). Read these before replying.")
+        st.dataframe(pd.DataFrame(others)[["ticket_id", "timestamp", "status", "summary"]],
+                     hide_index=True, width="stretch")
+    else:
+        st.markdown("**Same order or contact:** No other tickets.")
 
 
 def show_result(ticket):
@@ -184,8 +221,7 @@ def show_result(ticket):
     st.html(f"<div class='bc-heading'>Result for {html.escape(ticket['ticket_id'])}</div>")
     reason = ticket["escalation_reason"]
     if ticket["status"] == "Escalated":
-        banner("bad", "🔴 Escalated to human support", f"Reason: {reason}",
-               note="Next step: a support specialist should take over this ticket.")
+        banner("bad", "🔴 Escalated to human support", f"Reason: {reason}")
     elif ticket["status"] == "Resolved":
         banner("ok", body="🟢 Resolved" if reason else "🟢 Resolved by the AI desk")
     else:
@@ -197,6 +233,9 @@ def show_result(ticket):
         m2.metric("Urgency", ticket["urgency"])
         m3.metric("Sentiment", ticket["sentiment"])
         m4.metric("Reply confidence", ticket["confidence"])
+
+    if ticket["status"] in WAITING_STATUSES:
+        handoff_brief(ticket)
 
     with st.expander("More details", expanded=True):
         st.markdown(f"**Ticket ID:** {ticket['ticket_id']} · **Logged at:** {ticket['timestamp']}")
@@ -382,11 +421,14 @@ def ticket_log_tab(tickets):
             mask = mask | shown[column].str.contains(text, case=False, na=False, regex=False)
         shown = shown[mask]
 
-    st.caption(f"Showing {len(shown)} of {len(df)} tickets")
-    columns = ["ticket_id", "timestamp", "customer_name", "order_id",
-               "category", "urgency", "status", "escalation_reason", "summary"]
-    st.dataframe(shown.iloc[::-1][columns].style.map(colour_status, subset=["status"]),
-                 hide_index=True, width="stretch")
+    clocks = [reply_clock(row, read_actions(row["ticket_id"]), read_reply_mail(row["ticket_id"]))
+              for row in shown.to_dict("records")]
+    overdue = sum(clock.startswith("Overdue") for clock in clocks)
+    st.caption(f"Showing {len(shown)} of {len(df)} tickets · {overdue} overdue for a first reply")
+    columns = ["ticket_id", "timestamp", "customer_name", "order_id", "category", "urgency",
+               "status", "first_reply", "escalation_reason", "summary"]
+    grid = shown.assign(first_reply=clocks).iloc[::-1][columns]
+    st.dataframe(grid.style.map(colour_status, subset=["status"]), hide_index=True, width="stretch")
 
     d1, d2, _ = st.columns(3)
     d1.download_button("Download filtered view (CSV)", shown.to_csv(index=False),

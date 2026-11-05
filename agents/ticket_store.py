@@ -8,6 +8,8 @@ from pathlib import Path
 
 LOG_FILE = Path(__file__).resolve().parent.parent / "logs" / "tickets.csv"
 
+HUMAN_REQUEST_REASON = "Customer asked for a person"
+
 COLUMNS = [
     "ticket_id", "timestamp", "customer_name", "order_id", "complaint",
     "category", "urgency", "sentiment", "summary", "kb_sources",
@@ -17,6 +19,11 @@ COLUMNS = [
 # Words that point to a legal threat, fraud or a payment dispute.
 PAYMENT_LEGAL_PATTERN = re.compile(
     r"\b(lawyer|lawsuit|legal|attorney|sue|fraud|scam|chargeback|dispute|bank|charged)\b",
+    re.IGNORECASE,
+)
+# Words that show the customer wants a person rather than the AI.
+HUMAN_REQUEST_PATTERN = re.compile(
+    r"\b(human|real person|a person|live agent|an agent|representative|manager|supervisor)\b",
     re.IGNORECASE,
 )
 
@@ -52,6 +59,8 @@ def decide_escalation(complaint: str, urgency: str, sentiment: str,
         reasons.append("Legal threat, fraud or payment dispute")
     if confidence.strip().lower() == "low":
         reasons.append("Low resolution confidence")
+    if HUMAN_REQUEST_PATTERN.search(complaint):
+        reasons.append(HUMAN_REQUEST_REASON)
 
     if reasons:
         return "Escalated", "; ".join(reasons)
@@ -193,3 +202,81 @@ def read_reply_mail(ticket_id: str) -> dict | None:
     with REPLY_MAILS_FILE.open(newline="", encoding="utf-8") as f:
         matches = [r for r in csv.DictReader(f) if r["ticket_id"] == ticket_id]
     return matches[-1] if matches else None
+
+
+# ---- Talking to a person, first reply targets, related tickets --------------
+CUSTOMER_ACTOR = "customer"
+WAITING_STATUSES = ["Escalated", "Open", "In Progress"]
+# Business targets: change these to match what your team can really deliver.
+FIRST_REPLY_HOURS = {"High": 1, "Medium": 8, "Low": 24}
+
+
+def first_reply_hours(urgency: str) -> int:
+    return FIRST_REPLY_HOURS.get(urgency.strip().title(), FIRST_REPLY_HOURS["Low"])
+
+
+def request_human(ticket_id: str) -> bool:
+    """The customer asked for a person: escalate the ticket and record why."""
+    if not record_action(ticket_id, CUSTOMER_ACTOR, "Escalated", "Customer asked to talk to a person"):
+        return False
+    tickets = read_tickets()
+    for ticket in tickets:
+        if ticket["ticket_id"] == ticket_id and HUMAN_REQUEST_REASON not in ticket["escalation_reason"]:
+            ticket["escalation_reason"] = "; ".join(filter(None, [ticket["escalation_reason"], HUMAN_REQUEST_REASON]))
+    with LOG_FILE.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(tickets)
+    return True
+
+
+def _duration(minutes: int) -> str:
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    if days:
+        return f"{days}d {hours}h"
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+def reply_clock(ticket: dict, actions: list[dict], reply_mail: dict | None, now=None) -> str:
+    """Where a ticket stands against its first reply target.
+
+    The clock starts when the ticket is logged, or when the customer last asked
+    for a person. Any later reply mail or staff action stops it.
+    """
+    from datetime import datetime, timedelta
+
+    if ticket["status"] not in WAITING_STATUSES:
+        return "Not waiting"
+    start = max([ticket["timestamp"]] + [a["timestamp"] for a in actions
+                                         if a["helpdesk_user"] == CUSTOMER_ACTOR])
+    staff_times = [a["timestamp"] for a in actions if a["helpdesk_user"] != CUSTOMER_ACTOR]
+    if reply_mail:
+        staff_times.append(reply_mail["timestamp"])
+    if any(when >= start for when in staff_times):
+        return "Replied"
+
+    due = (datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
+           + timedelta(hours=first_reply_hours(ticket["urgency"])))
+    minutes = int((due - (now or datetime.now())).total_seconds() // 60)
+    return f"Due in {_duration(minutes)}" if minutes >= 0 else f"Overdue by {_duration(-minutes)}"
+
+
+def related_tickets(ticket: dict) -> list[dict]:
+    """Other tickets with the same order ID or contact, newest first. For staff only."""
+    contacts = {}
+    if CONTACTS_FILE.exists():
+        with CONTACTS_FILE.open(newline="", encoding="utf-8") as f:
+            contacts = {r["ticket_id"]: r["contact"].strip().lower() for r in csv.DictReader(f)}
+
+    order_id = ticket["order_id"].strip().lower()
+    contact = contacts.get(ticket["ticket_id"], "")
+    matches = []
+    for other in read_tickets():
+        if other["ticket_id"] == ticket["ticket_id"]:
+            continue
+        same_order = order_id not in ("", "not given") and other["order_id"].strip().lower() == order_id
+        same_contact = contact and contacts.get(other["ticket_id"]) == contact
+        if same_order or same_contact:
+            matches.append(other)
+    return matches[::-1]
